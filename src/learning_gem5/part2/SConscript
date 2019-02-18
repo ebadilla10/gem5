@@ -26,7 +26,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 # Authors: Jason Lowe-Power
-
+"""
 Import('*')
 
 SimObject('SimpleObject.py')
@@ -43,3 +43,4 @@ Source('simple_cache.cc')
 DebugFlag('HelloExample', "For Learning gem5 Part 2. Simple example debug flag")
 DebugFlag('SimpleMemobj', "For Learning gem5 Part 2.")
 DebugFlag('SimpleCache', "For Learning gem5 Part 2.")
+"""
