@@ -593,6 +593,45 @@ BaseCache::recvTimingResp(PacketPtr pkt)
         blk = handleFill(pkt, blk, writebacks, allocate);
         assert(blk != nullptr);
         ppFill->notify(pkt);
+        if (enableBank) {
+            unsigned bank_id = getBankId(pkt->getAddr());
+
+            if (banks[bank_id]->isBusy()) {
+                // Debug message
+                DPRINTF(CacheBank, "%s: bank %d is busy, service delayed\n",
+                        __func__, bank_id);
+
+                // Add the latency for the new pkt write
+                banks[bank_id]->extendService(cyclesToTicks(writeLatency));
+
+                // Update statistics
+                bank_blocked_reqs_memsp_mshr[bank_id]++;
+
+                // Debug message
+                DPRINTF(CacheBank, "%s: nextIdleTick for bank %d is: %ld\n",
+                        __func__, bank_id, banks[bank_id]->finishTick());
+            } else {
+                // Debug message
+                DPRINTF(CacheBank, "%s: blocking bank %d until tick %ld\n",
+                        __func__, bank_id, clockEdge(writeLatency));
+
+                // Mark the corresponding bank in service
+                banks[bank_id]->markInService(clockEdge(writeLatency),
+                                              Busy_ReadPkt_MemSidePort);
+            }
+
+            // Debug message
+            DPRINTF(CacheBank, "%s: blocking packet info: cmd = %s, "
+                    "PC = 0x%lX, address = 0x%lX, size = %d, bank_id = %d\n",
+                    __func__, pkt->cmdString(),
+                    pkt->req->hasPC() ? pkt->req->getPC() : 0,
+                    pkt->getAddr(), pkt->getSize(), bank_id);
+
+            // Update statistics
+            bank_blocked_cycles[bank_id] += writeLatency;
+            // bank_blocked_ticks[bank_id] += (writeLatency * clockPeriod());
+            // bank_blocking_accesses[bank_id]++;
+        }
     }
 
     if (blk && blk->isValid() && pkt->isClean() && !pkt->isInvalidate()) {
@@ -2576,6 +2615,8 @@ BaseCache::CpuSidePort::tryTiming(PacketPtr pkt)
 bool
 BaseCache::CpuSidePort::recvTimingReq(PacketPtr pkt)
 {
+#if 0
+/* Implement bank */
     assert(pkt->isRequest());
 
     if (cache->system->bypassCaches()) {
@@ -2589,6 +2630,72 @@ BaseCache::CpuSidePort::recvTimingReq(PacketPtr pkt)
         return true;
     }
     return false;
+#endif
+    assert(!cache->system->bypassCaches());
+
+    bool success = false;
+
+    bool effectiveAccess = cache->checkEffectiveAccess(pkt);
+    bool doNotBlock = cache->unlockedTags && !effectiveAccess;
+
+    unsigned bank_id = cache->getBankId(pkt->getAddr());
+    bool bank_busy = cache->enableBank && cache->banks[bank_id]->isBusy();
+
+    // Debug message
+    if (bank_busy && !effectiveAccess)
+        DPRINTF(CacheBank, "%s: accepting packet %s with bank %d busy: "
+                "%s\n", __func__, pkt->cmdString(), bank_id,
+                doNotBlock ? "YES" : "NO");
+
+    // always let express snoop packets through if even if blocked
+    if (pkt->isExpressSnoop()) {
+        // do not change the current retry state
+        bool M5_VAR_USED bypass_success = cache->recvTimingReq(pkt);
+        assert(bypass_success);
+        return true;
+    } else if ((blocked || mustSendRetry || bank_busy) && !doNotBlock) {
+        // either already committed to send a retry, or blocked
+        success = false;
+        if (bank_busy) {
+            // Debug message
+            DPRINTF(CacheBank, "%s: bank %d is busy, service denied\n",
+                    __func__, bank_id);
+
+            // Schedule retry event
+            owner.schedule(sendRetryEvent,
+                cache->banks[bank_id]->finishTick());
+
+            // Debug messages
+            DPRINTF(CacheBank, "%s: sendRetryEvent scheduled for bank %d "
+                    "at tick %ld\n", __func__, bank_id,
+                    cache->banks[bank_id]->finishTick());
+            DPRINTF(CacheBank, "%s: blocked packet info: cmd = %s, "
+                    "PC = 0x%lX, address = 0x%lX, size = %d, bank_id = %d\n",
+                    __func__, pkt->cmdString(),
+                    pkt->req->hasPC() ? pkt->req->getPC() : 0,
+                    pkt->getAddr(), pkt->getSize(), bank_id);
+
+            // Update statistics
+            cache->bank_blocked_retry_req[bank_id]++;
+            cache->bank_blocked_retry_ticks[bank_id]
+                += (cache->banks[bank_id]->finishTick() - curTick());
+            cache->bank_blocked_average_ticks_per_req[bank_id]++;
+            if (cache->banks[bank_id]->whyBusy() == Busy_WritePkt_CpuSidePort)
+                cache->bank_blocked_reqs_cpusp_write[bank_id]++;
+            else
+                cache->bank_blocked_reqs_cpusp_read[bank_id]++;
+        }
+    } else {
+        // pass it on to the cache, and let the cache decide if we
+        // have to retry or not
+        success = cache->recvTimingReq(pkt);
+    }
+
+    // remember if we have to retry
+    // if ( !bank_busy && (blocked || mustSendRetry))
+    mustSendRetry = !success;
+
+    return success;
 }
 
 Tick
