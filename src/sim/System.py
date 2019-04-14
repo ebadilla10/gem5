@@ -121,5 +121,10 @@ class System(MemObject):
     # Provide list of domains that need to be controlled by the handler
     dvfs_handler = DVFSHandler()
 
+    #Stack  allocation
+    stack_to_scratch = Param.Bool('false',
+           'allocate stack pages in scratchpad memory')
+    stack_stats = Param.Bool('false', 'track stack accesses')
+
     if buildEnv['USE_KVM']:
         kvm_vm = Param.KvmVM(NULL, 'KVM VM (i.e., shared memory domain)')

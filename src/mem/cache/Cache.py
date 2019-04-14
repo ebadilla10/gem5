@@ -83,6 +83,17 @@ class BaseCache(MemObject):
     tag_latency = Param.Cycles("Tag lookup latency")
     data_latency = Param.Cycles("Data access latency")
     response_latency = Param.Cycles("Latency for the return path on a miss");
+    #     "Write penalty compared to a read")
+    write_latency = Param.Cycles(0,"Write access latency")
+    enable_bank = Param.Bool(False,
+                          "Activate cache access with banks structure")
+    # A single bank by default TODO should it be as many as blocks?
+    num_banks = Param.Int(1, "Number of cache data array banks")
+    bank_intlv_high_bit = Param.Int(0,
+        "Cache data array bank interleave highest bit "
+        "(0=automatically aligned to cache line granularity)")
+    unlocked_tags = Param.Bool(True,
+        "Allow check tags even if bank is blocked, for CleanEvict mainly")
 
     warmup_percentage = Param.Percent(0,
         "Percentage of tags to be touched to warm up the cache")
@@ -154,4 +165,3 @@ class NoncoherentCache(BaseCache):
     # This is typically a last level cache and any clean
     # writebacks would be unnecessary traffic to the main memory.
     writeback_clean = False
-

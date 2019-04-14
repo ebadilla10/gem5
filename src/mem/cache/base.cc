@@ -80,6 +80,7 @@ BaseCache::BaseCache(const BaseCacheParams *p, unsigned blk_size)
     : MemObject(p),
       cpuSidePort (p->name + ".cpu_side", this, "CpuSidePort"),
       memSidePort(p->name + ".mem_side", this, "MemSidePort"),
+      banks(p->num_banks),
       mshrQueue("MSHRs", p->mshrs, 0, p->demand_mshr_reserve), // see below
       writeBuffer("write buffer", p->write_buffers, p->mshrs), // see below
       tags(p->tags),
@@ -96,6 +97,15 @@ BaseCache::BaseCache(const BaseCacheParams *p, unsigned blk_size)
       forwardLatency(p->tag_latency),
       fillLatency(p->data_latency),
       responseLatency(p->response_latency),
+      writeLatency(p->write_latency),
+      enableBank(p->enable_bank),
+      numBanks(p->num_banks),
+      bankIntlvBits(ceilLog2(p->num_banks)),
+      bankIntlvHighBit(p->bank_intlv_high_bit ? p->bank_intlv_high_bit :
+                       ceilLog2(blkSize) + bankIntlvBits -1),
+      bankIntlvLowBit(bankIntlvHighBit + 1 - bankIntlvBits),
+      bankIntlvMask(((ULL(1) << bankIntlvBits) - 1 ) << bankIntlvLowBit),
+      unlockedTags(p->unlocked_tags),
       sequentialAccess(p->sequential_access),
       numTarget(p->tgts_per_mshr),
       forwardSnoops(true),
@@ -103,6 +113,8 @@ BaseCache::BaseCache(const BaseCacheParams *p, unsigned blk_size)
       isReadOnly(p->is_read_only),
       blocked(0),
       order(0),
+      bankBlockedNum(0),
+      bankLastEvent(0),
       noTargetMSHR(nullptr),
       missCount(p->max_miss_count),
       addrRanges(p->addr_ranges.begin(), p->addr_ranges.end()),
@@ -122,11 +134,118 @@ BaseCache::BaseCache(const BaseCacheParams *p, unsigned blk_size)
     tags->tagsInit();
     if (prefetcher)
         prefetcher->setCache(this);
+
+    if (ULL(1) << bankIntlvBits != numBanks)
+        fatal("%s number of banks is not a power of 2", name());
+    uint64_t granularity = ULL(1) << bankIntlvLowBit;
+    if (granularity < blkSize)
+        fatal("%s bank interleave granularity (%ld) smaller than line size "
+              " (%ld)", name(), granularity, blkSize);
+    DPRINTF(CacheBank, "%s: creating banks\n", __func__);
+    for (unsigned i = 0; i < banks.size(); ++i) {
+        banks[i] = new Bank(csprintf("%s.banks%d", p->name, i), this);
+    }
 }
 
 BaseCache::~BaseCache()
 {
-    delete tempBlock;
+   for (unsigned i = 0; i < banks.size(); ++i) {
+      delete banks[i];
+   }
+   delete tempBlock;
+}
+
+void
+BaseCache::logBankInService(Tick time)
+{
+    assert(bankBlockedNum < banks.size());
+    concurrent_banks_ticks[bankBlockedNum] += time - bankLastEvent;
+    concurrent_banks_cycles[bankBlockedNum]
+        += ticksToCycles(time - bankLastEvent);
+    bankBlockedNum++;
+    bankLastEvent = time;
+}
+
+void
+BaseCache::logBankOutOfService(Tick time)
+{
+    assert(bankBlockedNum && bankBlockedNum <= banks.size());
+    concurrent_banks_ticks[bankBlockedNum] += time - bankLastEvent;
+    concurrent_banks_cycles[bankBlockedNum]
+        += ticksToCycles(time - bankLastEvent);
+    bankBlockedNum--;
+    bankLastEvent = time;
+}
+
+void
+BaseCache::Bank::processUpdateBusy()
+{
+    assert(inService);
+    DPRINTF(CacheBank, "%s: processing event updateBusyEvent\n", __func__);
+    cause = Busy_ReadPkt_MemSidePort;
+}
+
+void
+BaseCache::Bank::processEndService()
+{
+    assert(inService);
+    DPRINTF(CacheBank, "%s: processing event endServiceEvent\n", __func__);
+    unmarkInService();
+}
+
+void
+BaseCache::Bank::extendService(Tick extraTick)
+{
+    assert(inService);
+    assert(nextIdleTick >= curTick());
+    assert(endServiceEvent.scheduled());
+
+    DPRINTF(CacheBank, "%s: bank service already extended? %s\n",
+            __func__, extended ? "YES" : "NO");
+
+    // Should trigger updateBusyEvent only once during the bank lifetime:
+    // bank service is extended only for (write) accesses from memSidePort
+    if (!extended)
+    {
+        DPRINTF(CacheBank, "%s: scheduling event updateBusyEvent "
+                "to tick %ld\n", __func__, nextIdleTick);
+
+        owner.schedule(updateBusyEvent, nextIdleTick);
+    }
+
+    DPRINTF(CacheBank, "%s: extending service until tick %ld\n",
+            __func__, nextIdleTick + extraTick);
+
+    nextIdleTick += extraTick;
+    extended = true;
+    owner.reschedule(endServiceEvent, nextIdleTick);
+}
+
+void
+BaseCache::Bank::markInService(Tick finishTick, BankBusyCause newCause)
+{
+    assert(!inService);
+    assert(finishTick > curTick());
+    assert(!(endServiceEvent.scheduled()));
+
+    DPRINTF(CacheBank, "%s: in service until tick %ld (cause: %d)\n",
+            __func__, finishTick, newCause);
+
+    nextIdleTick = finishTick;
+    inService = true;
+    cause = newCause;
+    owner.logBankInService(curTick());
+    owner.schedule(endServiceEvent, nextIdleTick);
+}
+
+void
+BaseCache::Bank::unmarkInService()
+{
+    assert(inService && nextIdleTick <= curTick());
+    DPRINTF(CacheBank, "%s: service done, become idle\n", __func__);
+    inService = false;
+    extended = false;
+    owner.logBankOutOfService(nextIdleTick);
 }
 
 void
@@ -2280,6 +2399,131 @@ BaseCache::regStats()
     for (int i = 0; i < system->maxMasters(); i++) {
         overallAvgMshrUncacheableLatency.subname(i, system->getMasterName(i));
     }
+
+    // Stack statistics
+    total_accesses
+        .name(name() + ".total_accesses")
+        .desc("total number of hits + misses")
+        .flags(total | nozero)
+        ;
+    stack_accesses
+        .name(name() + ".stack_accesses")
+        .desc("total number of accesses to the stack")
+        .flags(total | nozero)
+        ;
+    monitored_stack_accesses
+        .name(name() + ".monitored_stack_accesses")
+        .desc("total number of monitored accesses to the stack")
+        .flags(total | nozero)
+        ;
+    stack_overall_access_rate
+        .name(name() + ".stack_overall_access_rate")
+        .desc("overall access rate to stack")
+        .flags(total | nozero | nonan)
+        ;
+    monitored_stack_overall_access_rate
+        .name(name() + ".monitored_stack_overall_access_rate")
+        .desc("overall monitored access rate to stack")
+        .flags(total | nozero | nonan)
+        ;
+    stack_overall_access_rate = stack_accesses / total_accesses;
+    monitored_stack_overall_access_rate = monitored_stack_accesses
+            / total_accesses;
+
+    // Bank statistics
+
+    concurrent_banks_ticks.init(banks.size() + 1);
+    concurrent_banks_ticks
+        .name(name() + ".concurrent_banks_ticks")
+        .desc("Number of ticks (i) banks are used concurrently")
+        .flags(total | nozero | nonan);
+
+    concurrent_banks_cycles.init(banks.size() + 1);
+    concurrent_banks_cycles
+        .name(name() + ".concurrent_banks_cycles")
+        .desc("Number of cycles (i) banks are used concurrently")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_ticks.init(banks.size());
+    bank_blocked_ticks
+        .name(name() + ".bank_blocked_ticks")
+        .desc("Number of ticks the bank is blocked")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_cycles.init(banks.size());
+    bank_blocked_cycles
+        .name(name() + ".bank_blocked_cycles")
+        .desc("Number of cycles the bank is blocked")
+        .flags(total | nozero | nonan);
+
+    bank_blocking_accesses.init(banks.size());
+    bank_blocking_accesses
+        .name(name() + ".bank_blocking_accesses")
+        .desc("Number of accesses blocking the bank")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_retry_req.init(banks.size());
+    bank_blocked_retry_req
+        .name(name() + ".bank_blocked_retry_req")
+        .desc("Number of rejected requests because the bank is blocked")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_retry_ticks.init(banks.size());
+    bank_blocked_retry_ticks
+        .name(name() + ".bank_blocked_retry_ticks")
+        .desc("Number of ticks a retry request is postponed")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_average_ticks_per_req.init(banks.size());
+    bank_blocked_average_ticks_per_req
+        .name(name() + ".bank_blocked_average_ticks_per_req")
+        .desc("Average ticks before retrying a request from a blocked bank")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_reqs_cpusp_read.init(banks.size());
+    bank_blocked_reqs_cpusp_read
+        .name(name() + ".bank_blocked_reqs_cpusp_read")
+        .desc("Number of rescheduled requests due to reads from CpuSidePort")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_reqs_cpusp_write.init(banks.size());
+    bank_blocked_reqs_cpusp_write
+        .name(name() + ".bank_blocked_reqs_cpusp_write")
+        .desc("Number of rescheduled requests due to writes from CpuSidePort")
+        .flags(total | nozero | nonan);
+
+    bank_blocked_reqs_memsp_mshr.init(banks.size());
+    bank_blocked_reqs_memsp_mshr
+        .name(name() + ".bank_blocked_reqs_memsp_mshr")
+        .desc("Number of delayed requests due to MSHR fills from MemSidePort")
+        .flags(total | nozero | nonan);
+
+/*
+    bank_blocked_average_ticks_per_req
+        .name(name() + ".bank_blocked_average_ticks_per_req")
+        .desc("Average ticks before retrying a request from a blocked bank")
+        .flags(total | nozero | nonan);
+    bank_blocked_average_ticks_per_req =
+         bank_blocked_retry_ticks.total() / bank_blocked_retry_req.total();
+*/
+/*
+    total_bank_blocks
+        .name(name() + ".total_bank_blocks")
+        .desc("Number of accesses blocking any bank")
+        .flags(total | nozero | nonan);
+    for (int i = 0; i < banks.size(); i++) {
+        total_bank_blocks += bank_blocking_accesses[i];
+        total_bank_blocks.subname(i, banks[i]->name());
+    }
+
+   total_bank_blocked_cycles
+        .name(name() + ".total_bank_blocked_cycles")
+        .desc("Number of cycles a bank was blocked")
+        .flags(total | nozero | nonan);
+   for (int i = 0; i < banks.size(); i++) {
+       total_bank_blocked_cycles += bank_blocked_cycles[i];
+       total_bank_blocks.subname(i, banks[i]->name());
+   }*/
 
     replacements
         .name(name() + ".replacements")

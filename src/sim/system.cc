@@ -97,6 +97,8 @@ System::System(Params *p)
       kernel(nullptr),
       loadAddrMask(p->load_addr_mask),
       loadAddrOffset(p->load_offset),
+      stack_to_scratch(p->stack_to_scratch),
+      stack_stats(p->stack_stats),
 #if USE_KVM
       kvmVM(p->kvm_vm),
 #else

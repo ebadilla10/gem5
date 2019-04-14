@@ -61,6 +61,7 @@
 #include "base/trace.hh"
 #include "base/types.hh"
 #include "debug/Cache.hh"
+#include "debug/CacheBank.hh"
 #include "debug/CachePort.hh"
 #include "enums/Clusivity.hh"
 #include "mem/cache/cache_blk.hh"
@@ -111,6 +112,15 @@ class BaseCache : public MemObject
         Blocked_NoWBBuffers = MSHRQueue_WriteBuffer,
         Blocked_NoTargets,
         NUM_BLOCKED_CAUSES
+    };
+
+    /**
+     * Reasons for banks to be busy.
+     */
+    enum BankBusyCause {
+        Busy_ReadPkt_CpuSidePort,
+        Busy_WritePkt_CpuSidePort,
+        Busy_ReadPkt_MemSidePort
     };
 
   protected:
@@ -311,7 +321,88 @@ class BaseCache : public MemObject
     CpuSidePort cpuSidePort;
     MemSidePort memSidePort;
 
+    /*
+    * Cache bank for delaying accesses
+    */
+    class Bank
+    {
+      private:
+        /* Descriptive name for DPRINTF */
+        std::string bankName;
+
+        /* Bank service status */
+        bool inService;
+
+        /* Bank service extended at least once */
+        bool extended;
+
+        /* Cause of utilization */
+        BankBusyCause cause;
+
+        /* Descriptive name for DPRINTF */
+        Tick nextIdleTick;
+
+        /* updateBusyEvent processing routine */
+        void processUpdateBusy();
+
+        /* endServiceEvent processing routine */
+        void processEndService();
+
+      public:
+
+        /*  Mark this cache bank in service until finishTick */
+        void markInService(Tick finishTick, BankBusyCause newCause);
+
+        /*  Unmark this cache bank in service */
+        void unmarkInService();
+
+        /*  Extend this bank service time by extraTick */
+        void extendService(Tick extraTick);
+
+        Bank(const std::string &_name, BaseCache *owner) :
+            bankName(_name),
+            inService(false),
+            extended(false),
+            cause((BankBusyCause)0),
+            nextIdleTick(0),
+            owner(*owner),
+            updateBusyEvent(this),
+            endServiceEvent(this)
+        { }
+
+        /*  Return the status of the bank (in service or not) */
+        bool isBusy() const { return inService; }
+
+        /*  Return the reason why the bank is busy */
+        BankBusyCause whyBusy() const { return cause; }
+
+        /*  Return the next tick when the bank will be idle */
+        Tick finishTick() const { return nextIdleTick; }
+
+        /*  Return bank name */
+        const std::string name() const { return bankName; }
+
+      protected:
+
+        /* A reference to the BaseCache that owns this bank. */
+        BaseCache& owner;
+
+        /**
+         * Event scheduled once after executing extendService()
+         * to have BankBusyCause updated at the right time
+         */
+        EventWrapper<Bank, &Bank::processUpdateBusy> updateBusyEvent;
+
+        /**
+         * Event scheduled after marking a bank in service or extending
+         * service time, to unmark it at the end of the last operation
+         */
+        EventWrapper<Bank, &Bank::processEndService> endServiceEvent;
+    };
+
   protected:
+    /* Data array banks */
+    std::vector<Bank *> banks;
 
     /** Miss status registers */
     MSHRQueue mshrQueue;
@@ -388,7 +479,7 @@ class BaseCache : public MemObject
         }
     }
 
-    /**
+    /**bankIntlvBits
      * Determine whether we should allocate on a fill or not. If this
      * cache is mostly inclusive with regards to the upstream cache(s)
      * we always allocate (for any non-forwarded and cacheable
@@ -545,7 +636,7 @@ class BaseCache : public MemObject
      *
      * @param pkt The packet with the requests
      * @param blk The referenced block
-     * @param writebacks A list with packets for any performed writebacks
+     * @param writebacks A list with packets fbankor any performed writebacks
      * @return Cycles for handling the request
      */
     virtual Cycles handleAtomicReqMiss(PacketPtr pkt, CacheBlk *&blk,
@@ -828,6 +919,32 @@ class BaseCache : public MemObject
      */
     const Cycles responseLatency;
 
+    /*
+    * The latency to write data into the cache
+    */
+    const Cycles writeLatency;
+
+    /* Enable banking feature for the cache */
+    const bool enableBank;
+
+    /* Number of cache array data banks */
+    const unsigned numBanks;
+
+    /* Number of cache bank interleave bits */
+    const unsigned bankIntlvBits;
+
+    /* Cache data array bank interleave high bit */
+    const unsigned bankIntlvHighBit;
+
+    /* Cache data array bank interleave low bit */
+    const unsigned bankIntlvLowBit;
+
+    /* Cache data array bank interleave mask */
+    const Addr bankIntlvMask;
+
+    /* Allow lookup tags even if blocked bank (CleanEvict) */
+    const bool unlockedTags;
+
     /**
      * Whether tags and data are accessed sequentially.
      */
@@ -865,6 +982,12 @@ class BaseCache : public MemObject
 
     /** Stores time the cache blocked for statistics. */
     Cycles blockedCycle;
+
+    /* Stores the number of blocked banks */
+    unsigned bankBlockedNum;
+
+    /* Stores the time of the last bank event (in ticks)*/
+    Tick bankLastEvent;
 
     /** Pointer to the MSHR that has no targets. */
     MSHR *noTargetMSHR;
@@ -1010,6 +1133,39 @@ class BaseCache : public MemObject
     /** Number of replacements of valid blocks. */
     Stats::Scalar replacements;
 
+    /** Stack access stats */
+     Stats::Scalar total_accesses;
+     Stats::Scalar stack_accesses;
+     Stats::Scalar monitored_stack_accesses;
+     Stats::Formula stack_overall_access_rate;
+     Stats::Formula monitored_stack_overall_access_rate;
+
+     /** Banks blocking stats */
+     // Stats::Formula total_bank_blocks;
+     // Stats::Formula total_bank_blocked_cycles;
+     /* Number of ticks (i) banks are used concurrently */
+     Stats::Vector concurrent_banks_ticks;
+     /* Number of cycles (i) banks are used concurrently */
+     Stats::Vector concurrent_banks_cycles;
+     /* Number of ticks a bank is blocked */
+     Stats::Vector bank_blocked_ticks;
+     /* Number of cycles a bank is blocked */
+     Stats::Vector bank_blocked_cycles;
+     /* Number of accesses resulting in a bank block */
+     Stats::Vector bank_blocking_accesses;
+     /* Number of rescheduled requests because the bank is blocked */
+     Stats::Vector bank_blocked_retry_req;
+     /* Number of ticks requests are rescheduled per bank */
+     Stats::Vector bank_blocked_retry_ticks;
+     /* Average ticks for reschedule requests per blocked bank */
+     Stats::AverageVector bank_blocked_average_ticks_per_req;
+     /* Number of rescheduled requests due to reads from CpuSidePort */
+     Stats::Vector bank_blocked_reqs_cpusp_read;
+     /* Number of rescheduled requests due to writes from CpuSidePort */
+     Stats::Vector bank_blocked_reqs_cpusp_write;
+     /* Number of delayed requests due to MSHR fills from MemSidePort */
+     Stats::Vector bank_blocked_reqs_memsp_mshr;
+
     /**
      * @}
      */
@@ -1039,6 +1195,13 @@ class BaseCache : public MemObject
     getBlockSize() const
     {
         return blkSize;
+    }
+
+    /* Query the bank ID from an address */
+    unsigned
+    getBankId(Addr addr) const
+    {//TODO add parameter for choosing allocation types and get accordingly?
+      return (addr &bankIntlvMask) >> bankIntlvLowBit;
     }
 
     const AddrRangeList &getAddrRanges() const { return addrRanges; }
@@ -1167,13 +1330,51 @@ class BaseCache : public MemObject
             if (missCount == 0)
                 exitSimLoop("A cache reached the maximum miss count");
         }
+
+        /** Count stack accesses */
+        if (system->stack_stats) {
+            total_accesses++;
+            for (AddrRange& range : system->stack_ranges) {
+                if (range.contains(pkt->getAddr())) {
+                    stack_accesses++;
+                    if (system->monitor_stack_accesses) {
+                        monitored_stack_accesses++;
+                    }
+                    break;
+                }
+            }
+        }
     }
     void incHitCount(PacketPtr pkt)
     {
         assert(pkt->req->masterId() < system->maxMasters());
         hits[pkt->cmdToIndex()][pkt->req->masterId()]++;
 
+        /** Count stack accesses */
+        if (system->stack_stats) {
+            total_accesses++;
+            for (AddrRange& range : system->stack_ranges) {
+                if (range.contains(pkt->getAddr())) {
+                    stack_accesses++;
+                    if (system->monitor_stack_accesses) {
+                        monitored_stack_accesses++;
+                    }
+                    break;
+                }
+            }
+        }
+
     }
+
+    /**
+     * Update the log when a bank is marked in service
+     */
+    void logBankInService(Tick time);
+
+    /**
+     * Update the log when a bank is marked out of service
+     */
+    void logBankOutOfService(Tick time);
 
     /**
      * Checks if the cache is coalescing writes

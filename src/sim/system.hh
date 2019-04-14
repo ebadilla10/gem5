@@ -251,6 +251,12 @@ class System : public MemObject
      */
     Addr loadAddrOffset;
 
+   bool stack_to_scratch;   //allocate stack pages in scratchpad
+   bool stack_stats;       //generate stack access statistics
+
+   bool monitor_stack_accesses; //enable stack accesses tracking
+   std::vector<AddrRange> stack_ranges; //stack address ranges
+
   public:
     /**
      * Get a pointer to the Kernel Virtual Machine (KVM) SimObject,
