@@ -1039,6 +1039,36 @@ BaseCache::satisfyRequest(PacketPtr pkt, CacheBlk *blk, bool, bool)
 // Access path: requests coming in from the CPU side
 //
 /////////////////////////////////////////////////////
+
+bool
+BaseCache::checkEffectiveAccess(const PacketPtr pkt) const
+{
+    // Clean eviction or writeback
+    if (pkt->isCleanEviction()) {
+
+        // CleanEvict command
+        if (pkt->cmd == MemCmd::CleanEvict)
+            return false;
+
+        // WritebackClean command and entry in MSHR queue
+        if (pkt->cmd == MemCmd::WritebackClean &&
+            mshrQueue.findMatch(pkt->getAddr(), pkt->isSecure()))
+            return false;
+
+        // Entry in writebuffer queue
+        if (writeBuffer.findMatch(pkt->getAddr(), pkt->isSecure()))
+            return false;
+    }
+
+    // Return true in all the other cases
+    return true;
+}
+
+/////////////////////////////////////////////////////
+//
+// Access path: requests coming in from the CPU side
+//
+/////////////////////////////////////////////////////
 Cycles
 BaseCache::calculateTagOnlyLatency(const uint32_t delay,
                                    const Cycles lookup_lat) const
@@ -2615,7 +2645,7 @@ BaseCache::CpuSidePort::tryTiming(PacketPtr pkt)
 bool
 BaseCache::CpuSidePort::recvTimingReq(PacketPtr pkt)
 {
-#if 0
+//Check this function
 /* Implement bank */
     assert(pkt->isRequest());
 
@@ -2630,7 +2660,7 @@ BaseCache::CpuSidePort::recvTimingReq(PacketPtr pkt)
         return true;
     }
     return false;
-#endif
+#if 0
     assert(!cache->system->bypassCaches());
 
     bool success = false;
@@ -2696,6 +2726,7 @@ BaseCache::CpuSidePort::recvTimingReq(PacketPtr pkt)
     mustSendRetry = !success;
 
     return success;
+#endif
 }
 
 Tick

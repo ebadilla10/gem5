@@ -503,6 +503,16 @@ class BaseCache : public MemObject
     }
 
     /**
+     * Checks whether a request is going to actually access the block
+     * or it can be handled only looking at the cache, writebuffer
+     * or MSHR tags.
+     *
+     * @param pkt The memory request to perform.
+     * @return Whether the block will be accessed or not.
+     */
+    bool checkEffectiveAccess(const PacketPtr pkt) const;
+
+    /**
      * Regenerate block address using tags.
      * Block address regeneration depends on whether we're using a temporary
      * block or not.
